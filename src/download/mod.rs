@@ -364,7 +364,7 @@ async fn download_file(
 ) -> Result<()> {
     if target_is_complete(&task).await? {
         if let Some(size) = task.remote.size {
-            progress.total.inc(size);
+            exclude_existing_bytes(&progress.total, None, size);
         }
         mark_file_done(progress, &task.remote.path);
         return Ok(());
@@ -386,7 +386,12 @@ async fn download_file(
         .await
         .unwrap_or(false);
     let size = task.remote.size.unwrap_or(0);
-    if accept_ranges && size >= LARGE_FILE_CHUNK_THRESHOLD {
+    let has_stream_part = fs::metadata(&task.part)
+        .await
+        .map(|meta| meta.len() > 0)
+        .unwrap_or(false)
+        && fs::metadata(&task.state).await.is_err();
+    if accept_ranges && size >= LARGE_FILE_CHUNK_THRESHOLD && !has_stream_part {
         let chunk_threads = DEFAULT_CHUNK_THREADS.min(threads).max(1);
         download_range_file(
             client,
@@ -468,10 +473,7 @@ async fn download_stream_file(
     let mut request = client.get(&task.url).headers(headers);
     if existing > 0 {
         request = request.header(RANGE, format!("bytes={existing}-"));
-        total_bar.inc(existing);
-        if let Some(detail_bar) = detail_bar {
-            detail_bar.inc(existing);
-        }
+        exclude_existing_bytes(total_bar, detail_bar, existing);
     }
 
     let response = request.send().await?.error_for_status()?;
@@ -520,10 +522,7 @@ async fn download_range_file(
         .filter(|(index, _)| state.completed.get(*index).copied().unwrap_or(false))
         .map(|(_, chunk)| chunk.len())
         .sum::<u64>();
-    total_bar.inc(completed_bytes);
-    if let Some(detail_bar) = detail_bar {
-        detail_bar.inc(completed_bytes);
-    }
+    exclude_existing_bytes(total_bar, detail_bar, completed_bytes);
 
     stream::iter(
         chunks
@@ -581,6 +580,18 @@ fn inc_bars(total_bar: &ProgressBar, detail_bar: Option<&ProgressBar>, amount: u
     total_bar.inc(amount);
     if let Some(detail_bar) = detail_bar {
         detail_bar.inc(amount);
+    }
+}
+
+fn exclude_existing_bytes(total_bar: &ProgressBar, detail_bar: Option<&ProgressBar>, amount: u64) {
+    if amount == 0 {
+        return;
+    }
+    total_bar.dec_length(amount);
+    total_bar.reset_eta();
+    if let Some(detail_bar) = detail_bar {
+        detail_bar.dec_length(amount);
+        detail_bar.reset_eta();
     }
 }
 

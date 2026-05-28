@@ -39,7 +39,7 @@ impl Config {
         Ok(Self {
             hf_token: env_first(&["HF_TOKEN", "HUGGINGFACE_HUB_TOKEN"]).or(file.hf_token),
             modelscope_token: env_first(&["MODELSCOPE_API_TOKEN"]).or(file.modelscope_token),
-            default_threads: file.default_threads.unwrap_or(4).max(1),
+            default_threads: file.default_threads.unwrap_or(6).max(1),
             cache_dir: file.cache_dir.unwrap_or(default_cache),
         })
     }
