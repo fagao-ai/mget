@@ -1,12 +1,15 @@
 use std::{
     path::{Path, PathBuf},
-    sync::Arc,
+    sync::{
+        Arc,
+        atomic::{AtomicUsize, Ordering},
+    },
     time::Duration,
 };
 
 use futures_util::{StreamExt, stream};
 use globset::{Glob, GlobSet, GlobSetBuilder};
-use indicatif::{MultiProgress, ProgressBar, ProgressStyle};
+use indicatif::{MultiProgress, ProgressBar, ProgressDrawTarget, ProgressStyle};
 use md5::Md5;
 use reqwest::{
     Client, StatusCode,
@@ -33,9 +36,11 @@ use crate::{
 };
 
 pub const USER_AGENT: &str = concat!("mget/", env!("CARGO_PKG_VERSION"));
-const LARGE_FILE_CHUNK_THRESHOLD: u64 = 64 * 1024 * 1024;
-const DEFAULT_CHUNK_SIZE: u64 = 16 * 1024 * 1024;
+const LARGE_FILE_CHUNK_THRESHOLD: u64 = 256 * 1024 * 1024;
+const DEFAULT_CHUNK_SIZE: u64 = 64 * 1024 * 1024;
+const DEFAULT_CHUNK_THREADS: usize = 2;
 const MAX_RETRIES: usize = 3;
+const DETAIL_BAR_THRESHOLD: u64 = 8 * 1024 * 1024;
 
 pub async fn run_download(args: DownloadArgs, config: Config) -> Result<()> {
     let effective = config.effective_for(&args);
@@ -48,12 +53,6 @@ pub async fn run_download(args: DownloadArgs, config: Config) -> Result<()> {
             resolved.requested_id, resolved.source_id
         );
     }
-    println!(
-        "Downloading {} [{}]",
-        resolved.source_id,
-        source.source_kind().label()
-    );
-
     let files = filter_files(source.list_files(&resolved).await?, &args)?;
     if files.is_empty() {
         return Err(MgetError::EmptyRepository(resolved.source_id));
@@ -67,6 +66,7 @@ pub async fn run_download(args: DownloadArgs, config: Config) -> Result<()> {
     );
     let plan = DownloadPlan::new(&*source, &resolved, files, output_root)?;
     preflight_disk_space(&plan).await?;
+    print_download_summary(&resolved, source.source_kind(), &plan);
     execute_plan(&plan, &*source, effective.threads).await?;
     cache::create_compat_links(args.link, source_kind, &resolved, &plan.output_root).await?;
     println!("Done: {}", plan.output_root.display());
@@ -220,10 +220,17 @@ async fn execute_plan(plan: &DownloadPlan, source: &dyn ModelSource, threads: us
         .user_agent(USER_AGENT)
         .build()
         .map_err(MgetError::Network)?;
-    let progress = MultiProgress::new();
-    let root = progress.add(ProgressBar::new(total_known_size(&plan.files)));
-    root.set_style(progress_style());
-    root.set_message(format!("{} files", plan.files.len()));
+    let progress = MultiProgress::with_draw_target(ProgressDrawTarget::stderr_with_hz(12));
+    let total_bar = progress.add(ProgressBar::new(total_known_size(&plan.files)));
+    total_bar.set_style(total_style());
+    total_bar.set_message("starting");
+    total_bar.enable_steady_tick(Duration::from_millis(250));
+    let progress_state = Arc::new(DownloadProgress {
+        multi: progress,
+        total: total_bar,
+        completed: AtomicUsize::new(0),
+        total_files: plan.files.len(),
+    });
 
     let semaphore = Arc::new(Semaphore::new(threads));
     stream::iter(plan.files.clone())
@@ -231,14 +238,13 @@ async fn execute_plan(plan: &DownloadPlan, source: &dyn ModelSource, threads: us
             let client = client.clone();
             let headers = source.auth_headers();
             let semaphore = semaphore.clone();
-            let root = root.clone();
-            let progress = progress.clone();
+            let progress_state = progress_state.clone();
             async move {
                 let _permit = semaphore
                     .acquire_owned()
                     .await
                     .map_err(|err| MgetError::Message(err.to_string()))?;
-                download_file_with_retry(&client, headers, task, &progress, &root, threads).await
+                download_file_with_retry(&client, headers, task, &progress_state, threads).await
             }
         })
         .buffer_unordered(threads)
@@ -247,42 +253,92 @@ async fn execute_plan(plan: &DownloadPlan, source: &dyn ModelSource, threads: us
         .into_iter()
         .collect::<Result<Vec<_>>>()?;
 
-    root.finish_with_message("complete");
+    progress_state.total.finish_with_message("complete");
     Ok(())
+}
+
+struct DownloadProgress {
+    multi: MultiProgress,
+    total: ProgressBar,
+    completed: AtomicUsize,
+    total_files: usize,
 }
 
 fn total_known_size(files: &[FileTask]) -> u64 {
     files.iter().filter_map(|task| task.remote.size).sum()
 }
 
-fn progress_style() -> ProgressStyle {
+fn print_download_summary(model: &ResolvedModel, source: SourceKind, plan: &DownloadPlan) {
+    let total = total_known_size(&plan.files);
+    println!("mget {}  {}", source.label(), model.source_id);
+    println!(
+        "files: {}  size: {}  target: {}",
+        plan.files.len(),
+        format_bytes(total),
+        plan.output_root.display()
+    );
+}
+
+fn display_path(path: &str) -> String {
+    const MAX_CHARS: usize = 42;
+    let count = path.chars().count();
+    if count <= MAX_CHARS {
+        return path.to_string();
+    }
+    let tail = path
+        .chars()
+        .rev()
+        .take(MAX_CHARS - 1)
+        .collect::<Vec<_>>()
+        .into_iter()
+        .rev()
+        .collect::<String>();
+    format!("…{tail}")
+}
+
+fn format_bytes(bytes: u64) -> String {
+    const UNITS: &[&str] = &["B", "KiB", "MiB", "GiB", "TiB"];
+    let mut value = bytes as f64;
+    let mut unit = 0;
+    while value >= 1024.0 && unit < UNITS.len() - 1 {
+        value /= 1024.0;
+        unit += 1;
+    }
+    if unit == 0 {
+        format!("{} {}", bytes, UNITS[unit])
+    } else {
+        format!("{value:.2} {}", UNITS[unit])
+    }
+}
+
+fn total_style() -> ProgressStyle {
     ProgressStyle::with_template(
-        "[{elapsed_precise}] [{bar:40.cyan/blue}] {bytes}/{total_bytes} {bytes_per_sec} eta {eta} {msg}",
+        "{spinner:.green} [{elapsed_precise}] {bar:36.cyan/blue} {bytes}/{total_bytes} {bytes_per_sec} eta {eta}  {wide_msg}",
     )
     .unwrap()
-    .progress_chars("=>-")
+    .progress_chars("━━╾")
+    .tick_strings(&["🌘", "🌗", "🌖", "🌕", "🌔", "🌓", "🌒", "🌑"])
+}
+
+fn detail_style() -> ProgressStyle {
+    ProgressStyle::with_template(
+        "{spinner:.magenta} [{elapsed_precise}] {bar:36.magenta/black} {bytes:>9}/{total_bytes:<9} {bytes_per_sec:>10}  {wide_msg}",
+    )
+    .unwrap()
+    .progress_chars("━━╾")
+    .tick_strings(&["◐", "◓", "◑", "◒"])
 }
 
 async fn download_file_with_retry(
     client: &Client,
     headers: HeaderMap,
     task: FileTask,
-    progress: &MultiProgress,
-    root: &ProgressBar,
+    progress: &DownloadProgress,
     threads: usize,
 ) -> Result<()> {
     let mut last_error = None;
     for attempt in 0..=MAX_RETRIES {
-        match download_file(
-            client,
-            headers.clone(),
-            task.clone(),
-            progress,
-            root,
-            threads,
-        )
-        .await
-        {
+        match download_file(client, headers.clone(), task.clone(), progress, threads).await {
             Ok(()) => return Ok(()),
             Err(err) => {
                 last_error = Some(err);
@@ -303,14 +359,14 @@ async fn download_file(
     client: &Client,
     headers: HeaderMap,
     task: FileTask,
-    progress: &MultiProgress,
-    root: &ProgressBar,
+    progress: &DownloadProgress,
     threads: usize,
 ) -> Result<()> {
     if target_is_complete(&task).await? {
         if let Some(size) = task.remote.size {
-            root.inc(size);
+            progress.total.inc(size);
         }
+        mark_file_done(progress, &task.remote.path);
         return Ok(());
     }
 
@@ -318,24 +374,62 @@ async fn download_file(
         fs::create_dir_all(parent).await?;
     }
 
-    let size = task.remote.size.unwrap_or(0);
-    let bar = progress.add(ProgressBar::new(size));
-    bar.set_style(progress_style());
-    bar.set_message(task.remote.path.clone());
+    progress.total.set_message(format!(
+        "{}/{} downloading {}",
+        progress.completed.load(Ordering::Relaxed),
+        progress.total_files,
+        display_path(&task.remote.path)
+    ));
+    let detail_bar = make_detail_bar(&progress.multi, &task);
 
     let accept_ranges = supports_ranges(client, &headers, &task)
         .await
         .unwrap_or(false);
+    let size = task.remote.size.unwrap_or(0);
     if accept_ranges && size >= LARGE_FILE_CHUNK_THRESHOLD {
-        download_range_file(client, headers, &task, &bar, root, size, threads).await?;
+        let chunk_threads = DEFAULT_CHUNK_THREADS.min(threads).max(1);
+        download_range_file(
+            client,
+            headers,
+            &task,
+            &progress.total,
+            detail_bar.as_ref(),
+            size,
+            chunk_threads,
+        )
+        .await?;
     } else {
-        download_stream_file(client, headers, &task, &bar, root).await?;
+        download_stream_file(client, headers, &task, &progress.total, detail_bar.as_ref()).await?;
     }
 
     verify_file(&task).await?;
     cleanup_temp_files(&task).await?;
-    bar.finish_with_message(format!("{} complete", task.remote.path));
+    if let Some(detail_bar) = detail_bar {
+        detail_bar.finish_and_clear();
+    }
+    mark_file_done(progress, &task.remote.path);
     Ok(())
+}
+
+fn make_detail_bar(progress: &MultiProgress, task: &FileTask) -> Option<ProgressBar> {
+    let size = task.remote.size?;
+    if size < DETAIL_BAR_THRESHOLD {
+        return None;
+    }
+    let bar = progress.add(ProgressBar::new(size));
+    bar.set_style(detail_style());
+    bar.set_message(display_path(&task.remote.path));
+    bar.enable_steady_tick(Duration::from_millis(250));
+    Some(bar)
+}
+
+fn mark_file_done(progress: &DownloadProgress, path: &str) {
+    let done = progress.completed.fetch_add(1, Ordering::Relaxed) + 1;
+    progress.total.set_message(format!(
+        "{done}/{} done {}",
+        progress.total_files,
+        display_path(path)
+    ));
 }
 
 async fn target_is_complete(task: &FileTask) -> Result<bool> {
@@ -364,8 +458,8 @@ async fn download_stream_file(
     client: &Client,
     headers: HeaderMap,
     task: &FileTask,
-    bar: &ProgressBar,
-    root: &ProgressBar,
+    total_bar: &ProgressBar,
+    detail_bar: Option<&ProgressBar>,
 ) -> Result<()> {
     let existing = fs::metadata(&task.part)
         .await
@@ -374,8 +468,10 @@ async fn download_stream_file(
     let mut request = client.get(&task.url).headers(headers);
     if existing > 0 {
         request = request.header(RANGE, format!("bytes={existing}-"));
-        bar.set_position(existing);
-        root.inc(existing);
+        total_bar.inc(existing);
+        if let Some(detail_bar) = detail_bar {
+            detail_bar.inc(existing);
+        }
     }
 
     let response = request.send().await?.error_for_status()?;
@@ -389,8 +485,7 @@ async fn download_stream_file(
     while let Some(chunk) = stream.next().await {
         let chunk = chunk?;
         file.write_all(&chunk).await?;
-        bar.inc(chunk.len() as u64);
-        root.inc(chunk.len() as u64);
+        inc_bars(total_bar, detail_bar, chunk.len() as u64);
     }
     file.flush().await?;
     fs::rename(&task.part, &task.target).await?;
@@ -401,8 +496,8 @@ async fn download_range_file(
     client: &Client,
     headers: HeaderMap,
     task: &FileTask,
-    bar: &ProgressBar,
-    root: &ProgressBar,
+    total_bar: &ProgressBar,
+    detail_bar: Option<&ProgressBar>,
     size: u64,
     threads: usize,
 ) -> Result<()> {
@@ -425,8 +520,10 @@ async fn download_range_file(
         .filter(|(index, _)| state.completed.get(*index).copied().unwrap_or(false))
         .map(|(_, chunk)| chunk.len())
         .sum::<u64>();
-    bar.set_position(completed_bytes);
-    root.inc(completed_bytes);
+    total_bar.inc(completed_bytes);
+    if let Some(detail_bar) = detail_bar {
+        detail_bar.inc(completed_bytes);
+    }
 
     stream::iter(
         chunks
@@ -439,7 +536,7 @@ async fn download_range_file(
     .map(|(index, chunk)| {
         let headers = headers.clone();
         async move {
-            download_one_chunk(client, headers, task, index, chunk, bar, root).await?;
+            download_one_chunk(client, headers, task, index, chunk, total_bar, detail_bar).await?;
             RangeState::mark_complete(&task.state, chunk_count, index).await
         }
     })
@@ -458,8 +555,8 @@ async fn download_one_chunk(
     task: &FileTask,
     _index: usize,
     chunk: ByteRange,
-    bar: &ProgressBar,
-    root: &ProgressBar,
+    total_bar: &ProgressBar,
+    detail_bar: Option<&ProgressBar>,
 ) -> Result<()> {
     let response = client
         .get(&task.url)
@@ -474,11 +571,17 @@ async fn download_one_chunk(
     while let Some(bytes) = stream.next().await {
         let bytes = bytes?;
         file.write_all(&bytes).await?;
-        bar.inc(bytes.len() as u64);
-        root.inc(bytes.len() as u64);
+        inc_bars(total_bar, detail_bar, bytes.len() as u64);
     }
     file.flush().await?;
     Ok(())
+}
+
+fn inc_bars(total_bar: &ProgressBar, detail_bar: Option<&ProgressBar>, amount: u64) {
+    total_bar.inc(amount);
+    if let Some(detail_bar) = detail_bar {
+        detail_bar.inc(amount);
+    }
 }
 
 #[derive(Debug, Clone, Copy)]
