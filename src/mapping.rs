@@ -27,6 +27,9 @@ pub async fn resolve_modelscope_id(
     }
 
     let candidates = source.search_models(input).await?;
+    if candidates.iter().any(|candidate| candidate == input) {
+        return Ok(input.to_string());
+    }
     match candidates.as_slice() {
         [single] => Ok(single.clone()),
         [] => Err(MgetError::ModelMappingNotFound(input.to_string())),
@@ -70,5 +73,36 @@ mod tests {
     #[test]
     fn unknown_prefix_is_none() {
         assert!(map_by_prefix("unknown/model").is_none());
+    }
+
+    #[tokio::test]
+    async fn exact_modelscope_candidate_wins_without_interaction() {
+        use crate::source::modelscope::ModelScopeSource;
+        use wiremock::{
+            Mock, MockServer, ResponseTemplate,
+            matchers::{method, path},
+        };
+
+        let server = MockServer::start().await;
+        Mock::given(method("PUT"))
+            .and(path("/api/v1/models/"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "Code": 200,
+                "Data": {
+                    "Models": [
+                        { "model_id": "google-bert/bert-base-chinese" },
+                        { "model_id": "google-bert/bert-base-cased" }
+                    ]
+                },
+                "Success": true
+            })))
+            .mount(&server)
+            .await;
+
+        let source = ModelScopeSource::with_base_url(server.uri(), None);
+        let resolved = resolve_modelscope_id("google-bert/bert-base-chinese", None, false, &source)
+            .await
+            .unwrap();
+        assert_eq!(resolved, "google-bert/bert-base-chinese");
     }
 }

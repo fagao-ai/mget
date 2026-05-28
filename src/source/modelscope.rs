@@ -6,8 +6,11 @@ use crate::{
 use async_trait::async_trait;
 use reqwest::{
     Client,
-    header::{AUTHORIZATION, HeaderMap, HeaderValue, USER_AGENT},
+    header::{AUTHORIZATION, CONTENT_TYPE, HeaderMap, HeaderValue, USER_AGENT},
 };
+
+const DEFAULT_MODELSCOPE_REVISION: &str = "master";
+const REQUEST_ID_HEADER: &str = "X-Request-ID";
 
 #[derive(Debug, Clone)]
 pub struct ModelScopeSource {
@@ -30,16 +33,43 @@ impl ModelScopeSource {
     }
 
     pub async fn search_models(&self, query: &str) -> Result<Vec<String>> {
+        let owner_or_group = query.split('/').next().unwrap_or(query);
         let response = self
             .client
-            .get(format!("{}/api/v1/models", self.base_url))
-            .query(&[("Name", query), ("PageSize", "5")])
+            .put(format!("{}/api/v1/models/", self.base_url))
             .headers(self.auth_headers())
+            .header(CONTENT_TYPE, "application/json")
+            .body(format!(
+                r#"{{"Path":"{}","PageNumber":1,"PageSize":100}}"#,
+                owner_or_group
+            ))
             .send()
             .await?
             .error_for_status()?;
         let value: serde_json::Value = response.json().await?;
-        Ok(extract_model_ids(&value))
+        let mut ids = extract_model_ids(&value);
+        if query.contains('/') {
+            ids.sort_by_key(|id| if id == query { 0 } else { 1 });
+        }
+        Ok(ids)
+    }
+
+    async fn list_files_for_revision(
+        &self,
+        model: &ResolvedModel,
+        revision: Option<&str>,
+    ) -> Result<Vec<RemoteFile>> {
+        let mut request = self
+            .client
+            .get(self.repo_files_url(model))
+            .query(&[("Recursive", "true")])
+            .headers(self.auth_headers());
+        if let Some(revision) = revision {
+            request = request.query(&[("Revision", revision)]);
+        }
+        let response = request.send().await?.error_for_status()?;
+        let value: serde_json::Value = response.json().await?;
+        Ok(extract_files(&value))
     }
 
     fn repo_files_url(&self, model: &ResolvedModel) -> String {
@@ -59,6 +89,9 @@ impl ModelSource for ModelScopeSource {
     fn auth_headers(&self) -> HeaderMap {
         let mut headers = HeaderMap::new();
         headers.insert(USER_AGENT, HeaderValue::from_static(MGET_USER_AGENT));
+        if let Ok(request_id) = HeaderValue::from_str(&uuid::Uuid::new_v4().simple().to_string()) {
+            headers.insert(REQUEST_ID_HEADER, request_id);
+        }
         if let Some(token) = &self.token
             && let Ok(value) = HeaderValue::from_str(&format!("Bearer {token}"))
         {
@@ -71,21 +104,22 @@ impl ModelSource for ModelScopeSource {
         Ok(ResolvedModel {
             requested_id: model.to_string(),
             source_id: model.to_string(),
-            revision: revision.to_string(),
+            revision: if revision == "main" {
+                DEFAULT_MODELSCOPE_REVISION.to_string()
+            } else {
+                revision.to_string()
+            },
         })
     }
 
     async fn list_files(&self, model: &ResolvedModel) -> Result<Vec<RemoteFile>> {
-        let response = self
-            .client
-            .get(self.repo_files_url(model))
-            .query(&[("Revision", model.revision.as_str()), ("Recursive", "true")])
-            .headers(self.auth_headers())
-            .send()
-            .await?
-            .error_for_status()?;
-        let value: serde_json::Value = response.json().await?;
-        Ok(extract_files(&value))
+        let files = self
+            .list_files_for_revision(model, Some(&model.revision))
+            .await?;
+        if files.is_empty() && model.revision == "master" {
+            return self.list_files_for_revision(model, None).await;
+        }
+        Ok(files)
     }
 
     fn download_url(&self, model: &ResolvedModel, file: &RemoteFile) -> String {
@@ -94,7 +128,7 @@ impl ModelSource for ModelScopeSource {
             self.base_url,
             model.source_id,
             urlencoding::encode(&model.revision),
-            urlencoding::encode(&file.path)
+            urlencoding::encode_binary(file.path.as_bytes()).replace("%20", "+")
         )
     }
 }
@@ -110,7 +144,9 @@ fn extract_model_ids(value: &serde_json::Value) -> Vec<String> {
 fn collect_model_ids(value: &serde_json::Value, out: &mut Vec<String>) {
     match value {
         serde_json::Value::Object(map) => {
-            for key in ["ModelId", "modelId", "Path", "path", "Name", "name"] {
+            for key in [
+                "ModelId", "modelId", "model_id", "Path", "path", "Name", "name",
+            ] {
                 if let Some(serde_json::Value::String(id)) = map.get(key)
                     && id.contains('/')
                 {
@@ -141,7 +177,10 @@ fn extract_files(value: &serde_json::Value) -> Vec<RemoteFile> {
 fn collect_files(value: &serde_json::Value, out: &mut Vec<RemoteFile>) {
     match value {
         serde_json::Value::Object(map) => {
-            let path = ["Path", "path", "Name", "name", "FilePath", "filePath"]
+            let name = ["Name", "name"]
+                .iter()
+                .find_map(|key| map.get(*key).and_then(|value| value.as_str()));
+            let path = ["Path", "path", "FilePath", "filePath", "Name", "name"]
                 .iter()
                 .find_map(|key| map.get(*key).and_then(|value| value.as_str()));
             let is_dir = ["Type", "type"]
@@ -153,7 +192,7 @@ fn collect_files(value: &serde_json::Value, out: &mut Vec<RemoteFile>) {
             if let Some(path) = path
                 && !is_dir
                 && !path.ends_with('/')
-                && path.contains('.')
+                && !matches!(name, Some(".gitignore" | ".gitattributes"))
             {
                 out.push(RemoteFile {
                     path: path.to_string(),
