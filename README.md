@@ -1,9 +1,23 @@
-# mget
+<p align="center">
+  <img src="assert/icon.svg" alt="mget icon" width="120" height="120">
+</p>
 
-`mget` is an intelligent multi-source downloader for model and dataset
-repositories. It can download from Hugging Face, HF Mirror, and ModelScope, with
-source probing, resumable downloads, optional chunked transfers, and cache
-compatibility links.
+<h1 align="center">mget</h1>
+
+<p align="center">
+  An intelligent multi-source downloader for model and dataset repositories.
+</p>
+
+<p align="center">
+  <a href="#installation">Installation</a> |
+  <a href="#quick-start">Quick Start</a> |
+  <a href="#command-reference">Command Reference</a> |
+  <a href="#development">Development</a>
+</p>
+
+`mget` can download from Hugging Face, HF Mirror, and ModelScope, with source
+probing, resumable downloads, optional chunked transfers, and cache compatibility
+links.
 
 ## Features
 
