@@ -6,7 +6,7 @@ use reqwest::{Client, StatusCode};
 use crate::{
     cli::SourceChoice,
     error::{MgetError, Result},
-    source::SourceKind,
+    source::{RepoType, SourceKind},
 };
 
 const PROBE_TIMEOUT: Duration = Duration::from_millis(2500);
@@ -46,13 +46,29 @@ pub async fn print_ping() -> Result<()> {
     Ok(())
 }
 
-pub async fn select_source(choice: SourceChoice) -> Result<SourceKind> {
+pub async fn select_source(choice: SourceChoice, repo_type: RepoType) -> Result<SourceKind> {
     match choice {
         SourceChoice::Hf => Ok(SourceKind::HuggingFace),
         SourceChoice::HfMirror => Ok(SourceKind::HfMirror),
         SourceChoice::Modelscope => Ok(SourceKind::ModelScope),
         SourceChoice::Auto => {
-            let results = probe_all().await;
+            let mut results = probe_all().await;
+            if repo_type == RepoType::Dataset {
+                let modelscope_available = results
+                    .iter()
+                    .any(|result| result.source == SourceKind::ModelScope && result.is_available());
+                results.retain(|result| {
+                    matches!(
+                        result.source,
+                        SourceKind::HuggingFace | SourceKind::HfMirror
+                    )
+                });
+                if modelscope_available && !results.iter().any(ProbeResult::is_available) {
+                    return Err(MgetError::Message(
+                        "dataset auto only probes Hugging Face/HF Mirror; pass --source modelscope for ModelScope datasets".into(),
+                    ));
+                }
+            }
             choose_best(&results)
         }
     }
@@ -158,5 +174,15 @@ mod tests {
             },
         ];
         assert_eq!(choose_best(&results).unwrap(), SourceKind::HfMirror);
+    }
+
+    #[tokio::test]
+    async fn explicit_modelscope_still_allowed_for_datasets() {
+        assert_eq!(
+            select_source(SourceChoice::Modelscope, RepoType::Dataset)
+                .await
+                .unwrap(),
+            SourceKind::ModelScope
+        );
     }
 }

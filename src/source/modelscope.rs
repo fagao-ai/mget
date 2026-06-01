@@ -1,12 +1,12 @@
 use crate::{
     download::USER_AGENT as MGET_USER_AGENT,
     error::Result,
-    source::{ModelSource, RemoteFile, ResolvedModel, SourceKind},
+    source::{ModelSource, RemoteFile, RepoType, ResolvedModel, SourceKind},
 };
 use async_trait::async_trait;
 use reqwest::{
     Client,
-    header::{AUTHORIZATION, CONTENT_TYPE, HeaderMap, HeaderValue, USER_AGENT},
+    header::{AUTHORIZATION, CONTENT_TYPE, COOKIE, HeaderMap, HeaderValue, USER_AGENT},
 };
 
 const DEFAULT_MODELSCOPE_REVISION: &str = "master";
@@ -59,9 +59,20 @@ impl ModelScopeSource {
         model: &ResolvedModel,
         revision: Option<&str>,
     ) -> Result<Vec<RemoteFile>> {
+        match model.repo_type {
+            RepoType::Model => self.list_model_files_for_revision(model, revision).await,
+            RepoType::Dataset => self.list_dataset_files_for_revision(model, revision).await,
+        }
+    }
+
+    async fn list_model_files_for_revision(
+        &self,
+        model: &ResolvedModel,
+        revision: Option<&str>,
+    ) -> Result<Vec<RemoteFile>> {
         let mut request = self
             .client
-            .get(self.repo_files_url(model))
+            .get(self.model_repo_files_url(model))
             .query(&[("Recursive", "true")])
             .headers(self.auth_headers());
         if let Some(revision) = revision {
@@ -72,7 +83,71 @@ impl ModelScopeSource {
         Ok(extract_files(&value))
     }
 
-    fn repo_files_url(&self, model: &ResolvedModel) -> String {
+    async fn list_dataset_files_for_revision(
+        &self,
+        model: &ResolvedModel,
+        revision: Option<&str>,
+    ) -> Result<Vec<RemoteFile>> {
+        let dataset_hub_id = self.dataset_hub_id(&model.source_id).await?;
+        let revision = revision.unwrap_or(&model.revision);
+        let page_size = 100;
+        let mut page_number = 1;
+        let mut out = Vec::new();
+
+        loop {
+            let response = self
+                .client
+                .get(format!(
+                    "{}/api/v1/datasets/{}/repo/tree",
+                    self.base_url, dataset_hub_id
+                ))
+                .query(&[
+                    ("Revision", revision),
+                    ("Root", "/"),
+                    ("Recursive", "True"),
+                    ("PageNumber", &page_number.to_string()),
+                    ("PageSize", &page_size.to_string()),
+                ])
+                .headers(self.auth_headers())
+                .send()
+                .await?
+                .error_for_status()?;
+            let value: serde_json::Value = response.json().await?;
+            let mut files = extract_files(&value);
+            let page_len = value
+                .pointer("/Data/Files")
+                .and_then(|value| value.as_array())
+                .map_or(files.len(), Vec::len);
+            out.append(&mut files);
+            if page_len < page_size {
+                break;
+            }
+            page_number += 1;
+        }
+
+        out.sort_by(|a, b| a.path.cmp(&b.path));
+        out.dedup_by(|a, b| a.path == b.path);
+        Ok(out)
+    }
+
+    async fn dataset_hub_id(&self, repo_id: &str) -> Result<String> {
+        let response = self
+            .client
+            .get(format!("{}/api/v1/datasets/{}", self.base_url, repo_id))
+            .headers(self.auth_headers())
+            .send()
+            .await?
+            .error_for_status()?;
+        let value: serde_json::Value = response.json().await?;
+        Ok(value
+            .pointer("/Data/Id")
+            .and_then(|value| value.as_str())
+            .or_else(|| value.pointer("/Data/id").and_then(|value| value.as_str()))
+            .map(ToOwned::to_owned)
+            .unwrap_or_else(|| repo_id.to_string()))
+    }
+
+    fn model_repo_files_url(&self, model: &ResolvedModel) -> String {
         format!(
             "{}/api/v1/models/{}/repo/files",
             self.base_url, model.source_id
@@ -97,13 +172,24 @@ impl ModelSource for ModelScopeSource {
         {
             headers.insert(AUTHORIZATION, value);
         }
+        if let Some(token) = &self.token
+            && let Ok(value) = HeaderValue::from_str(&format!("m_session_id={token}"))
+        {
+            headers.insert(COOKIE, value);
+        }
         headers
     }
 
-    async fn resolve_model(&self, model: &str, revision: &str) -> Result<ResolvedModel> {
+    async fn resolve_model(
+        &self,
+        model: &str,
+        repo_type: RepoType,
+        revision: &str,
+    ) -> Result<ResolvedModel> {
         Ok(ResolvedModel {
             requested_id: model.to_string(),
             source_id: model.to_string(),
+            repo_type,
             revision: if revision == "main" {
                 DEFAULT_MODELSCOPE_REVISION.to_string()
             } else {
@@ -123,13 +209,23 @@ impl ModelSource for ModelScopeSource {
     }
 
     fn download_url(&self, model: &ResolvedModel, file: &RemoteFile) -> String {
-        format!(
-            "{}/api/v1/models/{}/repo?Revision={}&FilePath={}",
-            self.base_url,
-            model.source_id,
-            urlencoding::encode(&model.revision),
-            urlencoding::encode_binary(file.path.as_bytes()).replace("%20", "+")
-        )
+        let path = urlencoding::encode_binary(file.path.as_bytes()).replace("%20", "+");
+        match model.repo_type {
+            RepoType::Model => format!(
+                "{}/api/v1/models/{}/repo?Revision={}&FilePath={}",
+                self.base_url,
+                model.source_id,
+                urlencoding::encode(&model.revision),
+                path
+            ),
+            RepoType::Dataset => format!(
+                "{}/api/v1/datasets/{}/repo?Source=SDK&Revision={}&FilePath={}&View=false",
+                self.base_url,
+                model.source_id,
+                urlencoding::encode(&model.revision),
+                path
+            ),
+        }
     }
 }
 
@@ -256,5 +352,49 @@ mod tests {
         assert_eq!(files[0].path, "README.md");
         assert_eq!(files[0].size, Some(10));
         assert_eq!(files[0].sha256.as_deref(), Some("abc"));
+    }
+
+    #[tokio::test]
+    async fn lists_modelscope_dataset_files_and_builds_dataset_url() {
+        use wiremock::{
+            Mock, MockServer, ResponseTemplate,
+            matchers::{method, path},
+        };
+
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/api/v1/datasets/owner/data"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "Data": { "Id": "dataset-hub-id", "Type": 1 }
+            })))
+            .mount(&server)
+            .await;
+        Mock::given(method("GET"))
+            .and(path("/api/v1/datasets/dataset-hub-id/repo/tree"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "Data": {
+                    "Files": [
+                        { "Path": "train/data.jsonl", "Type": "blob", "Size": 11, "Sha256": "def" }
+                    ]
+                }
+            })))
+            .mount(&server)
+            .await;
+
+        let source = ModelScopeSource::with_base_url(server.uri(), None);
+        let repo = source
+            .resolve_model("owner/data", RepoType::Dataset, "main")
+            .await
+            .unwrap();
+        let files = source.list_files(&repo).await.unwrap();
+
+        assert_eq!(files.len(), 1);
+        assert_eq!(files[0].path, "train/data.jsonl");
+        assert_eq!(files[0].size, Some(11));
+        assert!(
+            source
+                .download_url(&repo, &files[0])
+                .contains("/api/v1/datasets/owner/data/repo?Source=SDK&Revision=master")
+        );
     }
 }

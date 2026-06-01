@@ -42,6 +42,12 @@ pub enum MgetError {
         expected: String,
         actual: String,
     },
+    #[error("size mismatch for {path}: expected {expected}, got {actual}")]
+    SizeMismatch {
+        path: PathBuf,
+        expected: u64,
+        actual: u64,
+    },
     #[error("download failed after retries: {0}")]
     DownloadFailed(String),
     #[error("symlink target already exists and points elsewhere: {0}")]

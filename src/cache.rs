@@ -6,7 +6,7 @@ use tokio::fs;
 use crate::{
     cli::LinkChoice,
     error::{MgetError, Result},
-    source::{ResolvedModel, SourceKind},
+    source::{RepoType, ResolvedModel, SourceKind},
 };
 
 pub fn default_output_root(
@@ -17,9 +17,13 @@ pub fn default_output_root(
 ) -> PathBuf {
     explicit_output.map_or_else(
         || {
-            cache_dir
-                .join(source.cache_segment())
-                .join(sanitize_repo_id(&model.source_id))
+            let root = cache_dir.join(source.cache_segment());
+            let root = if matches!(model.repo_type, RepoType::Dataset) {
+                root.join(model.repo_type.cache_segment())
+            } else {
+                root
+            };
+            root.join(sanitize_repo_id(&model.source_id))
                 .join(sanitize_component(&model.revision))
         },
         Path::to_path_buf,
@@ -70,12 +74,19 @@ fn sanitize_component(component: &str) -> String {
 }
 
 fn hf_cache_path(model: &ResolvedModel) -> Option<PathBuf> {
+    let repo_prefix = match model.repo_type {
+        RepoType::Model => "models",
+        RepoType::Dataset => "datasets",
+    };
     BaseDirs::new().map(|dirs| {
         dirs.home_dir()
             .join(".cache")
             .join("huggingface")
             .join("hub")
-            .join(format!("models--{}", model.source_id.replace('/', "--")))
+            .join(format!(
+                "{repo_prefix}--{}",
+                model.requested_id.replace('/', "--")
+            ))
             .join("snapshots")
             .join(sanitize_component(&model.revision))
     })
@@ -83,22 +94,36 @@ fn hf_cache_path(model: &ResolvedModel) -> Option<PathBuf> {
 
 fn modelscope_cache_path(model: &ResolvedModel) -> Option<PathBuf> {
     BaseDirs::new().map(|dirs| {
-        dirs.home_dir()
+        let root = dirs
+            .home_dir()
             .join(".cache")
             .join("modelscope")
             .join("hub")
-            .join(sanitize_repo_id(&model.source_id))
-            .join(sanitize_component(&model.revision))
+            .join(sanitize_repo_id(&model.source_id));
+        if matches!(model.repo_type, RepoType::Dataset) {
+            dirs.home_dir()
+                .join(".cache")
+                .join("modelscope")
+                .join("hub")
+                .join("datasets")
+                .join(sanitize_repo_id(&model.source_id))
+        } else {
+            root.join(sanitize_component(&model.revision))
+        }
     })
 }
 
 async fn create_one_link(destination: &Path, target: &Path) -> Result<()> {
-    if destination.exists() {
-        let existing = fs::read_link(destination).await.ok();
-        if existing.as_deref() == Some(target) {
-            return Ok(());
+    match fs::symlink_metadata(destination).await {
+        Ok(_) => {
+            let existing = fs::read_link(destination).await.ok();
+            if existing.as_deref() == Some(target) {
+                return Ok(());
+            }
+            return Err(MgetError::SymlinkConflict(destination.to_path_buf()));
         }
-        return Err(MgetError::SymlinkConflict(destination.to_path_buf()));
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => {}
+        Err(err) => return Err(err.into()),
     }
     if let Some(parent) = destination.parent() {
         fs::create_dir_all(parent).await?;
@@ -156,5 +181,32 @@ mod tests {
     fn rejects_parent_dir_paths() {
         assert!(ensure_relative_repo_path("../secret").is_err());
         assert!(ensure_relative_repo_path("ok/file.txt").is_ok());
+    }
+
+    #[test]
+    fn hf_link_uses_requested_id_after_modelscope_mapping() {
+        let model = ResolvedModel {
+            requested_id: "meta-llama/Model".into(),
+            source_id: "LLM-Research/Model".into(),
+            repo_type: RepoType::Model,
+            revision: "main".into(),
+        };
+        let path = hf_cache_path(&model).unwrap();
+        assert!(path.to_string_lossy().contains("models--meta-llama--Model"));
+        assert!(!path.to_string_lossy().contains("LLM-Research"));
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn dangling_symlink_is_reported_as_conflict() {
+        let temp = tempfile::tempdir().unwrap();
+        let target = temp.path().join("target");
+        let link = temp.path().join("link");
+        std::os::unix::fs::symlink(temp.path().join("missing"), &link).unwrap();
+
+        assert!(matches!(
+            create_one_link(&link, &target).await,
+            Err(MgetError::SymlinkConflict(path)) if path == link
+        ));
     }
 }

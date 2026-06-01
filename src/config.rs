@@ -78,7 +78,7 @@ fn env_first(keys: &[&str]) -> Option<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::cli::{DownloadArgs, SourceChoice};
+    use crate::cli::{DownloadArgs, RepoTypeChoice, SourceChoice};
 
     #[test]
     fn cli_values_override_config_defaults() {
@@ -89,7 +89,10 @@ mod tests {
             cache_dir: PathBuf::from("/tmp/mget"),
         };
         let args = DownloadArgs {
-            model: "org/model".into(),
+            repo: Some("org/model".into()),
+            model_id: None,
+            dataset_id: None,
+            repo_type: RepoTypeChoice::Model,
             source: SourceChoice::Auto,
             output: None,
             threads: Some(16),

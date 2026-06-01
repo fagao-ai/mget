@@ -8,7 +8,7 @@ use serde::Deserialize;
 use crate::{
     download::USER_AGENT as MGET_USER_AGENT,
     error::Result,
-    source::{ModelSource, RemoteFile, ResolvedModel, SourceKind},
+    source::{ModelSource, RemoteFile, RepoType, ResolvedModel, SourceKind},
 };
 
 #[derive(Debug, Clone)]
@@ -42,12 +42,17 @@ impl HuggingFaceSource {
         }
     }
 
-    fn model_api_url(&self, model: &str, revision: &str) -> String {
+    fn repo_api_url(&self, model: &ResolvedModel) -> String {
+        let segment = match model.repo_type {
+            RepoType::Model => "models",
+            RepoType::Dataset => "datasets",
+        };
         format!(
-            "{}/api/models/{}/revision/{}",
+            "{}/api/{}/{}/revision/{}",
             self.base_url,
-            model,
-            urlencoding::encode(revision)
+            segment,
+            model.source_id,
+            urlencoding::encode(&model.revision)
         )
     }
 }
@@ -69,10 +74,16 @@ impl ModelSource for HuggingFaceSource {
         headers
     }
 
-    async fn resolve_model(&self, model: &str, revision: &str) -> Result<ResolvedModel> {
+    async fn resolve_model(
+        &self,
+        model: &str,
+        repo_type: RepoType,
+        revision: &str,
+    ) -> Result<ResolvedModel> {
         Ok(ResolvedModel {
             requested_id: model.to_string(),
             source_id: model.to_string(),
+            repo_type,
             revision: revision.to_string(),
         })
     }
@@ -80,7 +91,7 @@ impl ModelSource for HuggingFaceSource {
     async fn list_files(&self, model: &ResolvedModel) -> Result<Vec<RemoteFile>> {
         let response = self
             .client
-            .get(self.model_api_url(&model.source_id, &model.revision))
+            .get(self.repo_api_url(model))
             .headers(self.auth_headers())
             .send()
             .await?
@@ -104,9 +115,14 @@ impl ModelSource for HuggingFaceSource {
     }
 
     fn download_url(&self, model: &ResolvedModel, file: &RemoteFile) -> String {
+        let repo_prefix = match model.repo_type {
+            RepoType::Model => "",
+            RepoType::Dataset => "datasets/",
+        };
         format!(
-            "{}/{}/resolve/{}/{}",
+            "{}/{}{}/resolve/{}/{}",
             self.base_url,
+            repo_prefix,
             model.source_id,
             urlencoding::encode(&model.revision),
             file.path
@@ -173,7 +189,10 @@ mod tests {
             server.uri(),
             Some("secret".into()),
         );
-        let model = source.resolve_model("org/model", "main").await.unwrap();
+        let model = source
+            .resolve_model("org/model", RepoType::Model, "main")
+            .await
+            .unwrap();
         let files = source.list_files(&model).await.unwrap();
 
         assert_eq!(files.len(), 1);
@@ -184,6 +203,44 @@ mod tests {
             source
                 .download_url(&model, &files[0])
                 .ends_with("/org/model/resolve/main/README.md")
+        );
+    }
+
+    #[tokio::test]
+    async fn lists_hf_dataset_siblings_from_dataset_api() {
+        use wiremock::{
+            Mock, MockServer, ResponseTemplate,
+            matchers::{method, path},
+        };
+
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/api/datasets/org/data/revision/main"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "siblings": [
+                    {
+                        "rfilename": "train/data.jsonl",
+                        "size": 11,
+                        "sha256": "def"
+                    }
+                ]
+            })))
+            .mount(&server)
+            .await;
+
+        let source = HuggingFaceSource::with_base_url(SourceKind::HuggingFace, server.uri(), None);
+        let model = source
+            .resolve_model("org/data", RepoType::Dataset, "main")
+            .await
+            .unwrap();
+        let files = source.list_files(&model).await.unwrap();
+
+        assert_eq!(files.len(), 1);
+        assert_eq!(files[0].path, "train/data.jsonl");
+        assert!(
+            source
+                .download_url(&model, &files[0])
+                .ends_with("/datasets/org/data/resolve/main/train/data.jsonl")
         );
     }
 }
