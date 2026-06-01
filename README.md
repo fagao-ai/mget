@@ -33,6 +33,18 @@ links.
 
 ## Installation
 
+Install the latest release on macOS/Linux:
+
+```bash
+curl -fsSL https://raw.githubusercontent.com/fagao-ai/mget/main/scripts/install.sh | bash
+```
+
+Install the latest release on Windows PowerShell:
+
+```powershell
+iwr https://raw.githubusercontent.com/fagao-ai/mget/main/scripts/install.ps1 -useb | iex
+```
+
 From a local checkout:
 
 ```bash
