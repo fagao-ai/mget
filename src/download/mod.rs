@@ -1197,7 +1197,7 @@ async fn hash_file_md5(path: &Path) -> Result<String> {
 /// Verification reads a whole model file sequentially. Without this, those
 /// pages stay charged to the service cgroup as page cache and make `mget`
 /// look like it is using tens of gigabytes of RAM.
-#[cfg(unix)]
+#[cfg(target_os = "linux")]
 fn drop_page_cache(file: &File) {
     use std::os::unix::io::AsRawFd;
 
@@ -1207,7 +1207,7 @@ fn drop_page_cache(file: &File) {
     }
 }
 
-#[cfg(not(unix))]
+#[cfg(not(target_os = "linux"))]
 fn drop_page_cache(_: &File) {}
 
 async fn cleanup_temp_files(task: &FileTask) -> Result<()> {
