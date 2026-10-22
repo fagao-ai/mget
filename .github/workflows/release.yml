@@ -8,10 +8,15 @@ on:
 permissions:
   contents: write
 
+concurrency:
+  group: release-${{ github.ref }}
+  cancel-in-progress: true
+
 jobs:
   build:
     name: Build Release Artifacts
     runs-on: ${{ matrix.os }}
+    timeout-minutes: 45
     strategy:
       matrix:
         include:
@@ -35,6 +40,61 @@ jobs:
     steps:
       - name: Checkout code
         uses: actions/checkout@v4
+
+      - name: Set version from tag
+        shell: bash
+        run: |
+          release_version="${GITHUB_REF_NAME#v}"
+          if [[ ! "$release_version" =~ ^[0-9]+\.[0-9]+\.[0-9]+(\.[0-9A-Za-z.-]+)?([-+][0-9A-Za-z.-]+)?$ ]]; then
+            echo "Release tag $GITHUB_REF_NAME is not a supported version" >&2
+            exit 1
+          fi
+
+          # Cargo accepts three numeric components plus prerelease/build metadata.
+          # A long tag such as v0.2.0.20261022 becomes 0.2.0-20261022 for Cargo,
+          # while MGET_VERSION keeps the full tag for `mget --version`.
+          if [[ "$release_version" =~ ^([0-9]+\.[0-9]+\.[0-9]+)\.([0-9A-Za-z][0-9A-Za-z.-]*)$ ]]; then
+            cargo_version="${BASH_REMATCH[1]}-${BASH_REMATCH[2]}"
+          else
+            cargo_version="$release_version"
+          fi
+
+          python_cmd=python3
+          if [[ "${RUNNER_OS:-}" == "Windows" ]]; then
+            python_cmd=python
+          fi
+
+          "$python_cmd" - "$cargo_version" <<'PY'
+          import re
+          import sys
+
+          version = sys.argv[1]
+          path = "Cargo.toml"
+          text = open(path, encoding="utf-8").read()
+          text, count = re.subn(
+              r'(?m)^(version\s*=\s*")[^"]+(")',
+              lambda match: f"{match.group(1)}{version}{match.group(2)}",
+              text,
+              count=1,
+          )
+          if count != 1:
+              raise SystemExit("could not find the [package] version in Cargo.toml")
+          open(path, "w", encoding="utf-8").write(text)
+          PY
+
+          cargo update --package mget --precise "$cargo_version"
+
+          package_version="$(
+            cargo metadata --locked --no-deps --format-version 1 \
+              | "$python_cmd" -c 'import json,sys; print(json.load(sys.stdin)["packages"][0]["version"])'
+          )"
+          if [[ "$package_version" != "$cargo_version" ]]; then
+            echo "Cargo version $package_version does not match tag $GITHUB_REF_NAME" >&2
+            exit 1
+          fi
+
+          echo "MGET_VERSION=$release_version" >> "$GITHUB_ENV"
+          echo "Building mget $release_version (Cargo version $cargo_version)"
 
       - name: Install Rust
         uses: dtolnay/rust-toolchain@stable

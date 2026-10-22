@@ -7,7 +7,7 @@ use crate::source::RepoType;
 #[derive(Debug, Parser)]
 #[command(
     name = "mget",
-    version,
+    version = env!("MGET_VERSION"),
     about = "Intelligent multi-source LLM downloader"
 )]
 pub struct Cli {

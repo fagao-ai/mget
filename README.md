@@ -250,6 +250,16 @@ cargo test
 cargo clippy --all-targets -- -D warnings
 ```
 
+## Release Versioning
+
+Releases are tag-driven. Pushing a tag such as `v0.2.0` makes the release workflow rewrite
+`Cargo.toml` and `Cargo.lock` from the tag before building, so `mget --version` reports the
+tagged version.
+
+Long tags are supported too. `v0.2.0.20261022` is shown as `mget 0.2.0.20261022`; Cargo uses
+the semver-compatible form `0.2.0-20261022` internally. Local builds use
+`0.2.0+YYYYMMDD.<commit>` so they are distinguishable from release binaries.
+
 ## License
 
 MIT
