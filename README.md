@@ -77,6 +77,7 @@ Use a specific source:
 ```bash
 mget download Qwen/Qwen2.5-0.5B-Instruct --source hf
 mget download Qwen/Qwen2.5-0.5B-Instruct --source hf-mirror
+mget download Qwen/Qwen2.5-0.5B-Instruct --source hf-mirror-net
 mget download Qwen/Qwen2.5-0.5B-Instruct --source modelscope
 ```
 
@@ -97,6 +98,13 @@ Download selected files:
 ```bash
 mget download Qwen/Qwen2.5-0.5B-Instruct --file README.md
 mget download Qwen/Qwen2.5-0.5B-Instruct --include "*.safetensors" --exclude "*00002*"
+```
+
+HTTP/1.1 is used by default. Enable HTTP/2 when multiplexing helps on a
+high-latency link:
+
+```bash
+mget download Qwen/Qwen2.5-0.5B-Instruct --http2
 ```
 
 Choose an output directory:
@@ -124,9 +132,11 @@ Options:
       --model <MODEL_ID>
       --dataset <DATASET_ID>
       --repo-type <model|dataset>
-  -s, --source <auto|hf|hf-mirror|modelscope>
+  -s, --source <auto|hf|hf-mirror|hf-mirror-net|modelscope>
   -o, --output <OUTPUT>
   -t, --threads <THREADS>
+      --chunk-threads <N>
+      --http2
       --revision <REVISION>
       --file <PATH>
       --include <GLOB>
@@ -144,12 +154,28 @@ Options:
 
 - `auto`: probe sources and choose a fast available source.
 - `hf`: use `https://huggingface.co`.
-- `hf-mirror`: use `https://hf-mirror.com`.
+- `hf-mirror`: use `https://hf-mirror.com`, falling back to
+  `https://hf-mirror.net` when the primary mirror is unreachable.
+- `hf-mirror-net`: force `https://hf-mirror.net` (Cloudflare-backed mirror).
 - `modelscope`: use `https://modelscope.cn`.
 
-For datasets, `auto` only probes Hugging Face and HF Mirror to avoid routing a
-Hugging Face dataset id to ModelScope accidentally. Use `--source modelscope`
-explicitly for ModelScope datasets.
+For datasets, `auto` only probes Hugging Face and the HF Mirrors to avoid
+routing a Hugging Face dataset id to ModelScope accidentally. Use
+`--source modelscope` explicitly for ModelScope datasets.
+
+`auto` ranks every reachable source and falls back to the next one if a
+repository lookup fails, so a HF-only model is not lost just because
+ModelScope answered the latency probe first.
+
+`-t/--threads` controls how many files are downloaded at once, while
+`--chunk-threads` controls how many range chunks are fetched per large file
+(default 4, capped by `--threads`). For a single multi-hundred-GB file,
+`--threads 16 --chunk-threads 16` gives the most parallelism.
+
+After SHA256/MD5 verification, mget asks the OS to drop the verified file from
+the page cache. This keeps verification from being counted as tens of GB of
+process RAM, but the first model load afterwards may need to read the file from
+disk again.
 
 ## Resuming Downloads
 
@@ -160,6 +186,12 @@ Interrupted downloads leave temporary files next to the target file:
 
 Run the same command again to resume. If the server ignores range requests, mget
 falls back safely to a fresh stream download instead of appending invalid data.
+If a chunked range download is interrupted, completed chunks and their state
+are kept and only the missing chunks are fetched on the next attempt; mget
+never discards a partial ranged download to restart it as a stream.
+If the state file itself is corrupt, it is moved aside as
+`*.mget-state.json.corrupt` and the file restarts safely instead of failing
+forever.
 
 ## Cache and Compatibility Links
 
@@ -202,6 +234,7 @@ Config file values are also supported:
 hf_token = "..."
 modelscope_token = "..."
 default_threads = 6
+default_chunk_threads = 4
 cache_dir = "/path/to/cache"
 ```
 

@@ -38,23 +38,62 @@ use crate::{
 pub const USER_AGENT: &str = concat!("mget/", env!("CARGO_PKG_VERSION"));
 const LARGE_FILE_CHUNK_THRESHOLD: u64 = 256 * 1024 * 1024;
 const DEFAULT_CHUNK_SIZE: u64 = 64 * 1024 * 1024;
-const DEFAULT_CHUNK_THREADS: usize = 2;
 const MAX_RETRIES: usize = 3;
 const DETAIL_BAR_THRESHOLD: u64 = 8 * 1024 * 1024;
+
+#[derive(Debug, Clone, Copy)]
+struct DownloadTuning {
+    chunk_size: u64,
+    range_threshold: u64,
+    chunk_threads: usize,
+}
+
+const DEFAULT_TUNING: DownloadTuning = DownloadTuning {
+    chunk_size: DEFAULT_CHUNK_SIZE,
+    range_threshold: LARGE_FILE_CHUNK_THRESHOLD,
+    chunk_threads: 4,
+};
 
 pub async fn run_download(args: DownloadArgs, config: Config) -> Result<()> {
     let effective = config.effective_for(&args);
     let repo_type = args.repo_type();
-    let source_kind = routing::select_source(args.source, repo_type).await?;
-    let source = build_source(source_kind, &effective);
-    let resolved = resolve_model(&args, repo_type, &*source, source_kind, &effective).await?;
+    let candidates = routing::candidate_sources(args.source, repo_type).await?;
+    let mut last_error = None;
+    let mut selected = None;
+    for source_kind in candidates {
+        let source = build_source(source_kind, &effective);
+        let resolved =
+            match resolve_model(&args, repo_type, &*source, source_kind, &effective).await {
+                Ok(resolved) => resolved,
+                Err(err) => {
+                    eprintln!("warning: {source_kind} lookup failed: {err}; trying next source");
+                    last_error = Some(err);
+                    continue;
+                }
+            };
+        match source.list_files(&resolved).await {
+            Ok(files) => {
+                selected = Some((source_kind, source, resolved, files));
+                break;
+            }
+            Err(err) => {
+                eprintln!(
+                    "warning: {source_kind} cannot list {}: {err}; trying next source",
+                    resolved.source_id
+                );
+                last_error = Some(err);
+            }
+        }
+    }
+    let (source_kind, source, resolved, files) =
+        selected.ok_or_else(|| last_error.unwrap_or(MgetError::NoAvailableSource))?;
     if resolved.requested_id != resolved.source_id {
         println!(
             "Mapped repo id: {} -> {}",
             resolved.requested_id, resolved.source_id
         );
     }
-    let files = filter_files(source.list_files(&resolved).await?, &args)?;
+    let files = filter_files(files, &args)?;
     if files.is_empty() {
         return Err(MgetError::EmptyRepository(resolved.source_id));
     }
@@ -67,9 +106,16 @@ pub async fn run_download(args: DownloadArgs, config: Config) -> Result<()> {
         &resolved,
     );
     let plan = DownloadPlan::new(&*source, &resolved, files, output_root)?;
-    preflight_disk_space(&plan).await?;
+    preflight_disk_space(&plan, DEFAULT_CHUNK_SIZE).await?;
     print_download_summary(&resolved, source.source_kind(), &plan);
-    execute_plan(&plan, &*source, effective.threads).await?;
+    execute_plan(
+        &plan,
+        &*source,
+        effective.threads,
+        effective.chunk_threads,
+        args.http2,
+    )
+    .await?;
     cache::create_compat_links(args.link, source_kind, &resolved, &plan.output_root).await?;
     println!("Done: {}", plan.output_root.display());
     Ok(())
@@ -77,7 +123,7 @@ pub async fn run_download(args: DownloadArgs, config: Config) -> Result<()> {
 
 fn build_source(source_kind: SourceKind, config: &EffectiveConfig) -> Box<dyn ModelSource> {
     match source_kind {
-        SourceKind::HuggingFace | SourceKind::HfMirror => {
+        SourceKind::HuggingFace | SourceKind::HfMirror | SourceKind::HfMirrorNet => {
             Box::new(HuggingFaceSource::new(source_kind, config.hf_token.clone()))
         }
         SourceKind::ModelScope => Box::new(ModelScopeSource::new(config.modelscope_token.clone())),
@@ -283,11 +329,11 @@ fn parse_content_range_bounds(value: &str) -> Option<(u64, u64)> {
     Some((start.parse().ok()?, end.parse().ok()?))
 }
 
-async fn preflight_disk_space(plan: &DownloadPlan) -> Result<()> {
+async fn preflight_disk_space(plan: &DownloadPlan, chunk_size: u64) -> Result<()> {
     fs::create_dir_all(&plan.output_root).await?;
     let mut needed = 0;
     for task in &plan.files {
-        needed += task_remaining_size(task).await?;
+        needed += task_remaining_size(task, chunk_size).await?;
     }
     if needed == 0 {
         return Ok(());
@@ -303,7 +349,7 @@ async fn preflight_disk_space(plan: &DownloadPlan) -> Result<()> {
     Ok(())
 }
 
-async fn task_remaining_size(task: &FileTask) -> Result<u64> {
+async fn task_remaining_size(task: &FileTask, chunk_size: u64) -> Result<u64> {
     let Some(size) = task.remote.size else {
         return Ok(0);
     };
@@ -316,7 +362,7 @@ async fn task_remaining_size(task: &FileTask) -> Result<u64> {
     if part_meta.as_ref().is_some_and(|meta| meta.len() == size)
         && fs::metadata(&task.state).await.is_ok()
     {
-        let chunks = make_chunks(size, DEFAULT_CHUNK_SIZE);
+        let chunks = make_chunks(size, chunk_size);
         let state = RangeState::load(&task.state, chunks.len()).await?;
         return Ok(chunks
             .iter()
@@ -330,11 +376,27 @@ async fn task_remaining_size(task: &FileTask) -> Result<u64> {
     Ok(size.saturating_sub(part_len.min(size)))
 }
 
-async fn execute_plan(plan: &DownloadPlan, source: &dyn ModelSource, threads: usize) -> Result<()> {
-    let client = Client::builder()
+async fn execute_plan(
+    plan: &DownloadPlan,
+    source: &dyn ModelSource,
+    threads: usize,
+    chunk_threads: usize,
+    http2: bool,
+) -> Result<()> {
+    let tuning = DownloadTuning {
+        chunk_threads: chunk_threads.min(threads).max(1),
+        ..DEFAULT_TUNING
+    };
+    let mut builder = Client::builder()
         .user_agent(USER_AGENT)
-        .build()
-        .map_err(MgetError::Network)?;
+        .connect_timeout(Duration::from_secs(30));
+    if !http2 {
+        // HTTP/1.1 is the default: large range downloads are bandwidth-bound,
+        // and some mirrors reset long HTTP/2 streams. HTTP/2 can be enabled
+        // explicitly for high-latency links where multiplexing helps.
+        builder = builder.http1_only();
+    }
+    let client = builder.build().map_err(MgetError::Network)?;
     let progress = MultiProgress::with_draw_target(ProgressDrawTarget::stderr_with_hz(12));
     let total_bar = progress.add(ProgressBar::new(total_known_size(&plan.files)));
     total_bar.set_style(total_style());
@@ -359,7 +421,7 @@ async fn execute_plan(plan: &DownloadPlan, source: &dyn ModelSource, threads: us
                     .acquire_owned()
                     .await
                     .map_err(|err| MgetError::Message(err.to_string()))?;
-                download_file_with_retry(&client, headers, task, &progress_state, threads).await
+                download_file_with_retry(&client, headers, task, &progress_state, tuning).await
             }
         })
         .buffer_unordered(threads)
@@ -460,11 +522,11 @@ async fn download_file_with_retry(
     headers: HeaderMap,
     task: FileTask,
     progress: &DownloadProgress,
-    threads: usize,
+    tuning: DownloadTuning,
 ) -> Result<()> {
     let mut last_error = None;
     for attempt in 0..=MAX_RETRIES {
-        match download_file(client, headers.clone(), task.clone(), progress, threads).await {
+        match download_file(client, headers.clone(), task.clone(), progress, tuning).await {
             Ok(()) => return Ok(()),
             Err(err) => {
                 last_error = Some(err);
@@ -486,7 +548,7 @@ async fn download_file(
     headers: HeaderMap,
     task: FileTask,
     progress: &DownloadProgress,
-    threads: usize,
+    tuning: DownloadTuning,
 ) -> Result<()> {
     if target_is_complete(&task).await? {
         if let Some(size) = task.remote.size {
@@ -512,15 +574,23 @@ async fn download_file(
         .await
         .unwrap_or(false);
     let size = task.remote.size.unwrap_or(0);
-    let has_stream_part = fs::metadata(&task.part)
+    let part_len = fs::metadata(&task.part)
         .await
-        .map(|meta| meta.len() > 0)
-        .unwrap_or(false)
-        && fs::metadata(&task.state).await.is_err();
-    if accept_ranges && size >= LARGE_FILE_CHUNK_THRESHOLD && !has_stream_part {
-        let chunk_threads = DEFAULT_CHUNK_THREADS.min(threads).max(1);
+        .map(|meta| meta.len())
+        .unwrap_or(0);
+    let has_range_state = fs::metadata(&task.state).await.is_ok();
+    // A range download preallocates the part to the full size before the
+    // first chunk is recorded. Such a part must not be mistaken for a
+    // resumable stream part, or it can be renamed into place while sparse.
+    let has_stream_part = part_len > 0 && part_len < size && !has_range_state;
+    // A range state file proves this part was preallocated for ranged
+    // download. Keep using ranges even if a transient HEAD failure stops
+    // Accept-Ranges from being advertised on this retry.
+    if (accept_ranges || has_range_state) && size >= tuning.range_threshold && !has_stream_part {
         sanitize_range_resume_state(&task, size).await?;
-        let completed_before = range_completed_bytes(&task, size).await.unwrap_or(0);
+        let completed_before = range_completed_bytes(&task, size, tuning.chunk_size)
+            .await
+            .unwrap_or(0);
         let range_attempt_bytes = Arc::new(AtomicU64::new(0));
         let range_result = download_range_file(
             client,
@@ -531,14 +601,16 @@ async fn download_file(
                 detail: detail_bar.as_ref(),
             },
             size,
-            chunk_threads,
+            tuning,
             range_attempt_bytes.clone(),
         )
         .await;
         if let Err(err) = range_result {
             eprintln!(
-                "warning: ranged download failed for {}; falling back to stream: {err}",
-                task.remote.path
+                "warning: ranged download interrupted for {}; keeping completed chunks \
+                 ({:.1} MiB were already complete) and retrying: {err}",
+                task.remote.path,
+                completed_before as f64 / 1024.0 / 1024.0
             );
             restore_range_progress(
                 &progress.total,
@@ -546,9 +618,14 @@ async fn download_file(
                 completed_before,
                 range_attempt_bytes.load(Ordering::Relaxed),
             );
-            cleanup_temp_files(&task).await?;
-            download_stream_file(client, headers, &task, &progress.total, detail_bar.as_ref())
-                .await?;
+            if let Some(bar) = detail_bar.as_ref() {
+                bar.finish_and_clear();
+            }
+            // Do not fall back to a stream restart here. A ranged download may
+            // have written tens of gigabytes already, and truncating the part
+            // file (or cleaning up its state) throws that work away. The outer
+            // retry loop resumes from the untouched chunk state instead.
+            return Err(err);
         }
     } else {
         download_stream_file(client, headers, &task, &progress.total, detail_bar.as_ref()).await?;
@@ -616,8 +693,8 @@ async fn supports_ranges(client: &Client, headers: &HeaderMap, task: &FileTask) 
         .is_some_and(|value| value.eq_ignore_ascii_case("bytes")))
 }
 
-async fn range_completed_bytes(task: &FileTask, size: u64) -> Result<u64> {
-    let chunks = make_chunks(size, DEFAULT_CHUNK_SIZE);
+async fn range_completed_bytes(task: &FileTask, size: u64, chunk_size: u64) -> Result<u64> {
+    let chunks = make_chunks(size, chunk_size);
     let state = RangeState::load(&task.state, chunks.len()).await?;
     Ok(chunks
         .iter()
@@ -675,6 +752,12 @@ async fn download_stream_file(
         .unwrap_or(0);
     if let Some(size) = task.remote.size {
         if existing == size {
+            if fs::metadata(&task.state).await.is_ok() {
+                return Err(MgetError::Message(format!(
+                    "refusing to finalize preallocated range part for {} as a stream download",
+                    task.remote.path
+                )));
+            }
             fs::rename(&task.part, &task.target).await?;
             exclude_existing_bytes(total_bar, detail_bar, size);
             return Ok(());
@@ -742,11 +825,14 @@ async fn download_range_file(
     task: &FileTask,
     bars: ProgressBars<'_>,
     size: u64,
-    threads: usize,
+    tuning: DownloadTuning,
     attempt_bytes: Arc<AtomicU64>,
 ) -> Result<()> {
-    let chunks = make_chunks(size, DEFAULT_CHUNK_SIZE);
+    let chunks = make_chunks(size, tuning.chunk_size);
     let chunk_count = chunks.len();
+    // Write an all-false state before preallocating the part. Its presence is
+    // what distinguishes a range download from a stream partial file.
+    RangeState::ensure(&task.state, chunk_count).await?;
     let state = RangeState::load(&task.state, chunks.len()).await?;
     let file = OpenOptions::new()
         .create(true)
@@ -780,12 +866,31 @@ async fn download_range_file(
         let state_lock = state_lock.clone();
         let attempt_bytes = attempt_bytes.clone();
         async move {
-            download_one_chunk(client, headers, task, chunk, bars, &attempt_bytes).await?;
+            let mut last_error = None;
+            for attempt in 0..=MAX_RETRIES {
+                match download_one_chunk(client, headers.clone(), task, chunk, bars, &attempt_bytes)
+                    .await
+                {
+                    Ok(()) => {
+                        last_error = None;
+                        break;
+                    }
+                    Err(err) => {
+                        last_error = Some(err);
+                        if attempt < MAX_RETRIES {
+                            sleep(Duration::from_millis(300 * 2_u64.pow(attempt as u32))).await;
+                        }
+                    }
+                }
+            }
+            if let Some(err) = last_error {
+                return Err(err);
+            }
             let _guard = state_lock.lock().await;
             RangeState::mark_complete(&task.state, chunk_count, index).await
         }
     })
-    .buffer_unordered(threads.max(1))
+    .buffer_unordered(tuning.chunk_threads)
     .collect::<Vec<_>>()
     .await
     .into_iter()
@@ -829,14 +934,55 @@ async fn download_one_chunk(
     let mut file = OpenOptions::new().write(true).open(&task.part).await?;
     file.seek(SeekFrom::Start(chunk.start)).await?;
     let mut stream = response.bytes_stream();
-    while let Some(bytes) = stream.next().await {
-        let bytes = bytes?;
-        file.write_all(&bytes).await?;
-        attempt_bytes.fetch_add(bytes.len() as u64, Ordering::Relaxed);
-        inc_bars(bars.total, bars.detail, bytes.len() as u64);
+    let mut written = 0;
+    let result: Result<()> = async {
+        while let Some(bytes) = stream.next().await {
+            let bytes = bytes?;
+            let remaining = chunk.len() - written;
+            if bytes.len() as u64 > remaining {
+                // Never let an oversized body spill into the next chunk. Write
+                // only the requested bytes and fail the chunk so it is fetched
+                // again from a clean boundary.
+                if remaining > 0 {
+                    file.write_all(&bytes[..remaining as usize]).await?;
+                    written += remaining;
+                    attempt_bytes.fetch_add(remaining, Ordering::Relaxed);
+                    inc_bars(bars.total, bars.detail, remaining);
+                }
+                return Err(MgetError::Message(format!(
+                    "long body for {} chunk {}-{}: got at least {} bytes, want {}",
+                    task.remote.path,
+                    chunk.start,
+                    chunk.end,
+                    written + (bytes.len() as u64 - remaining),
+                    chunk.len()
+                )));
+            }
+            file.write_all(&bytes).await?;
+            written += bytes.len() as u64;
+            attempt_bytes.fetch_add(bytes.len() as u64, Ordering::Relaxed);
+            inc_bars(bars.total, bars.detail, bytes.len() as u64);
+        }
+        file.flush().await?;
+        if written != chunk.len() {
+            return Err(MgetError::Message(format!(
+                "short body for {} chunk {}-{}: got {written} bytes, want {}",
+                task.remote.path,
+                chunk.start,
+                chunk.end,
+                chunk.len()
+            )));
+        }
+        Ok(())
     }
-    file.flush().await?;
-    Ok(())
+    .await;
+    if result.is_err() && written > 0 {
+        // A failed chunk is retried from its start. Roll back its partial
+        // progress so the bars and the retry accounting stay accurate.
+        dec_bars(bars.total, bars.detail, written);
+        attempt_bytes.fetch_sub(written, Ordering::Relaxed);
+    }
+    result
 }
 
 fn inc_bars(total_bar: &ProgressBar, detail_bar: Option<&ProgressBar>, amount: u64) {
@@ -911,11 +1057,26 @@ struct RangeState {
 impl RangeState {
     async fn load(path: &Path, chunk_count: usize) -> Result<Self> {
         match fs::read_to_string(path).await {
-            Ok(content) => {
-                let mut state: Self = serde_json::from_str(&content)?;
-                state.completed.resize(chunk_count, false);
-                Ok(state)
-            }
+            Ok(content) => match serde_json::from_str::<Self>(&content) {
+                Ok(mut state) => {
+                    state.completed.resize(chunk_count, false);
+                    Ok(state)
+                }
+                Err(err) => {
+                    eprintln!(
+                        "warning: corrupt resume state {} ({err}); restarting this file",
+                        path.display()
+                    );
+                    let backup = path.with_extension("json.corrupt");
+                    remove_if_exists(&backup).await?;
+                    fs::rename(path, &backup).await?;
+                    let state = Self {
+                        completed: vec![false; chunk_count],
+                    };
+                    Self::save(path, &state).await?;
+                    Ok(state)
+                }
+            },
             Err(err) if err.kind() == std::io::ErrorKind::NotFound => Ok(Self {
                 completed: vec![false; chunk_count],
             }),
@@ -923,14 +1084,38 @@ impl RangeState {
         }
     }
 
+    async fn ensure(path: &Path, chunk_count: usize) -> Result<()> {
+        match fs::metadata(path).await {
+            Ok(_) => Ok(()),
+            Err(err) if err.kind() == std::io::ErrorKind::NotFound => {
+                Self::save(
+                    path,
+                    &Self {
+                        completed: vec![false; chunk_count],
+                    },
+                )
+                .await
+            }
+            Err(err) => Err(err.into()),
+        }
+    }
+
+    async fn save(path: &Path, state: &Self) -> Result<()> {
+        let content = serde_json::to_vec_pretty(state)?;
+        // Write-then-rename keeps the resume state valid if the process is
+        // killed while a chunk is being recorded.
+        let tmp = path.with_extension("json.tmp");
+        fs::write(&tmp, content).await?;
+        fs::rename(&tmp, path).await?;
+        Ok(())
+    }
+
     async fn mark_complete(path: &Path, chunk_count: usize, index: usize) -> Result<()> {
         let mut state = Self::load(path, chunk_count).await?;
         if let Some(item) = state.completed.get_mut(index) {
             *item = true;
         }
-        let content = serde_json::to_vec_pretty(&state)?;
-        fs::write(path, content).await?;
-        Ok(())
+        Self::save(path, &state).await
     }
 }
 
@@ -988,7 +1173,9 @@ async fn hash_file_sha256(path: &Path) -> Result<String> {
         }
         hasher.update(&buf[..read]);
     }
-    Ok(hex::encode(hasher.finalize()))
+    let digest = hex::encode(hasher.finalize());
+    drop_page_cache(&file);
+    Ok(digest)
 }
 
 async fn hash_file_md5(path: &Path) -> Result<String> {
@@ -1002,8 +1189,26 @@ async fn hash_file_md5(path: &Path) -> Result<String> {
         }
         hasher.update(&buf[..read]);
     }
-    Ok(hex::encode(hasher.finalize()))
+    let digest = hex::encode(hasher.finalize());
+    drop_page_cache(&file);
+    Ok(digest)
 }
+
+/// Verification reads a whole model file sequentially. Without this, those
+/// pages stay charged to the service cgroup as page cache and make `mget`
+/// look like it is using tens of gigabytes of RAM.
+#[cfg(unix)]
+fn drop_page_cache(file: &File) {
+    use std::os::unix::io::AsRawFd;
+
+    // SAFETY: the fd is owned by `file` and stays valid for the call.
+    unsafe {
+        libc::posix_fadvise(file.as_raw_fd(), 0, 0, libc::POSIX_FADV_DONTNEED);
+    }
+}
+
+#[cfg(not(unix))]
+fn drop_page_cache(_: &File) {}
 
 async fn cleanup_temp_files(task: &FileTask) -> Result<()> {
     for path in [&task.part, &task.state] {
@@ -1017,6 +1222,14 @@ mod tests {
     use super::*;
     use crate::cli::{DownloadArgs, RepoTypeChoice, SourceChoice};
 
+    fn test_tuning() -> DownloadTuning {
+        DownloadTuning {
+            chunk_size: 8,
+            range_threshold: 16,
+            chunk_threads: 2,
+        }
+    }
+
     fn args() -> DownloadArgs {
         DownloadArgs {
             repo: Some("org/model".into()),
@@ -1026,6 +1239,8 @@ mod tests {
             source: SourceChoice::Auto,
             output: None,
             threads: None,
+            chunk_threads: None,
+            http2: false,
             revision: "main".into(),
             files: vec![],
             includes: vec![],
@@ -1302,6 +1517,293 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn range_chunk_rejects_short_body() {
+        use reqwest::header::HeaderMap;
+        use wiremock::{
+            Mock, MockServer, ResponseTemplate,
+            matchers::{method, path},
+        };
+
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/file.bin"))
+            .respond_with(
+                ResponseTemplate::new(206)
+                    .insert_header("content-range", "bytes 0-7/16")
+                    .set_body_bytes(b"abcd".to_vec()),
+            )
+            .mount(&server)
+            .await;
+
+        let temp = tempfile::tempdir().unwrap();
+        let target = temp.path().join("file.bin");
+        let part = target.with_extension("bin.mget-part");
+        let file = OpenOptions::new()
+            .create(true)
+            .write(true)
+            .truncate(true)
+            .open(&part)
+            .await
+            .unwrap();
+        file.set_len(16).await.unwrap();
+        drop(file);
+        let task = FileTask {
+            remote: RemoteFile {
+                path: "file.bin".into(),
+                size: Some(16),
+                sha256: None,
+                md5: None,
+            },
+            url: format!("{}/file.bin", server.uri()),
+            target,
+            part,
+            state: temp.path().join("file.bin.mget-state.json"),
+        };
+        let total_bar = ProgressBar::hidden();
+
+        let err = download_one_chunk(
+            &Client::new(),
+            HeaderMap::new(),
+            &task,
+            ByteRange { start: 0, end: 7 },
+            ProgressBars {
+                total: &total_bar,
+                detail: None,
+            },
+            &AtomicU64::new(0),
+        )
+        .await
+        .unwrap_err();
+
+        assert!(err.to_string().contains("short body"));
+    }
+
+    #[tokio::test]
+    async fn range_chunk_rejects_long_body_without_spilling() {
+        use reqwest::header::HeaderMap;
+        use wiremock::{
+            Mock, MockServer, ResponseTemplate,
+            matchers::{method, path},
+        };
+
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/file.bin"))
+            .respond_with(
+                ResponseTemplate::new(206)
+                    .insert_header("content-range", "bytes 0-7/16")
+                    .set_body_bytes(b"abcdefghijkl".to_vec()),
+            )
+            .mount(&server)
+            .await;
+
+        let temp = tempfile::tempdir().unwrap();
+        let target = temp.path().join("file.bin");
+        let part = target.with_extension("bin.mget-part");
+        tokio::fs::write(&part, vec![0xAA; 16]).await.unwrap();
+        let task = FileTask {
+            remote: RemoteFile {
+                path: "file.bin".into(),
+                size: Some(16),
+                sha256: None,
+                md5: None,
+            },
+            url: format!("{}/file.bin", server.uri()),
+            target,
+            part: part.clone(),
+            state: temp.path().join("file.bin.mget-state.json"),
+        };
+        let total_bar = ProgressBar::hidden();
+
+        let err = download_one_chunk(
+            &Client::new(),
+            HeaderMap::new(),
+            &task,
+            ByteRange { start: 0, end: 7 },
+            ProgressBars {
+                total: &total_bar,
+                detail: None,
+            },
+            &AtomicU64::new(0),
+        )
+        .await
+        .unwrap_err();
+
+        assert!(err.to_string().contains("long body"));
+        let data = tokio::fs::read(&part).await.unwrap();
+        assert_eq!(&data[..8], b"abcdefgh");
+        assert_eq!(&data[8..], &[0xAA; 8]);
+    }
+
+    #[tokio::test]
+    async fn corrupt_state_is_quarantined_and_reset() {
+        let temp = tempfile::tempdir().unwrap();
+        let state = temp.path().join("file.bin.mget-state.json");
+        tokio::fs::write(&state, b"{not valid json").await.unwrap();
+
+        let loaded = RangeState::load(&state, 3).await.unwrap();
+        assert_eq!(loaded.completed, vec![false, false, false]);
+        assert!(
+            tokio::fs::metadata(state.with_extension("json.corrupt"))
+                .await
+                .is_ok()
+        );
+
+        RangeState::mark_complete(&state, 3, 1).await.unwrap();
+        let reloaded = RangeState::load(&state, 3).await.unwrap();
+        assert_eq!(reloaded.completed, vec![false, true, false]);
+    }
+
+    #[tokio::test]
+    async fn preallocated_part_without_state_uses_range_download() {
+        use reqwest::header::HeaderMap;
+        use wiremock::{
+            Mock, MockServer, ResponseTemplate,
+            matchers::{header, method, path},
+        };
+
+        let server = MockServer::start().await;
+        Mock::given(method("HEAD"))
+            .and(path("/file.bin"))
+            .respond_with(ResponseTemplate::new(206).insert_header("content-range", "bytes 0-0/16"))
+            .mount(&server)
+            .await;
+        for (range, content_range, body) in [
+            ("bytes=0-7", "bytes 0-7/16", &b"abcdefgh"[..]),
+            ("bytes=8-15", "bytes 8-15/16", &b"ijklmnop"[..]),
+        ] {
+            Mock::given(method("GET"))
+                .and(path("/file.bin"))
+                .and(header("range", range))
+                .respond_with(
+                    ResponseTemplate::new(206)
+                        .insert_header("content-range", content_range)
+                        .set_body_bytes(body.to_vec()),
+                )
+                .mount(&server)
+                .await;
+        }
+
+        let temp = tempfile::tempdir().unwrap();
+        let target = temp.path().join("file.bin");
+        let part = target.with_extension("bin.mget-part");
+        let file = OpenOptions::new()
+            .create(true)
+            .write(true)
+            .truncate(true)
+            .open(&part)
+            .await
+            .unwrap();
+        file.set_len(16).await.unwrap();
+        drop(file);
+        let task = FileTask {
+            remote: RemoteFile {
+                path: "file.bin".into(),
+                size: Some(16),
+                sha256: None,
+                md5: None,
+            },
+            url: format!("{}/file.bin", server.uri()),
+            target: target.clone(),
+            part,
+            state: target.with_extension("bin.mget-state.json"),
+        };
+        let progress = DownloadProgress {
+            multi: MultiProgress::new(),
+            total: ProgressBar::hidden(),
+            completed: AtomicUsize::new(0),
+            total_files: 1,
+        };
+
+        download_file(
+            &Client::new(),
+            HeaderMap::new(),
+            task,
+            &progress,
+            test_tuning(),
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(tokio::fs::read(&target).await.unwrap(), b"abcdefghijklmnop");
+    }
+
+    #[tokio::test]
+    async fn range_state_prevents_sparse_part_from_being_finalized_as_stream() {
+        use reqwest::header::HeaderMap;
+        use wiremock::{
+            Mock, MockServer, ResponseTemplate,
+            matchers::{header, method, path},
+        };
+
+        let server = MockServer::start().await;
+        Mock::given(method("HEAD"))
+            .and(path("/file.bin"))
+            .respond_with(ResponseTemplate::new(200))
+            .mount(&server)
+            .await;
+        for (range, content_range, body) in [
+            ("bytes=0-7", "bytes 0-7/16", &b"abcdefgh"[..]),
+            ("bytes=8-15", "bytes 8-15/16", &b"ijklmnop"[..]),
+        ] {
+            Mock::given(method("GET"))
+                .and(path("/file.bin"))
+                .and(header("range", range))
+                .respond_with(
+                    ResponseTemplate::new(206)
+                        .insert_header("content-range", content_range)
+                        .set_body_bytes(body.to_vec()),
+                )
+                .mount(&server)
+                .await;
+        }
+
+        let temp = tempfile::tempdir().unwrap();
+        let target = temp.path().join("file.bin");
+        let part = target.with_extension("bin.mget-part");
+        let state = target.with_extension("bin.mget-state.json");
+        tokio::fs::write(&part, vec![0; 16]).await.unwrap();
+        RangeState::save(
+            &state,
+            &RangeState {
+                completed: vec![false, false],
+            },
+        )
+        .await
+        .unwrap();
+        let task = FileTask {
+            remote: RemoteFile {
+                path: "file.bin".into(),
+                size: Some(16),
+                sha256: None,
+                md5: None,
+            },
+            url: format!("{}/file.bin", server.uri()),
+            target: target.clone(),
+            part,
+            state,
+        };
+        let progress = DownloadProgress {
+            multi: MultiProgress::new(),
+            total: ProgressBar::hidden(),
+            completed: AtomicUsize::new(0),
+            total_files: 1,
+        };
+
+        download_file(
+            &Client::new(),
+            HeaderMap::new(),
+            task,
+            &progress,
+            test_tuning(),
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(tokio::fs::read(&target).await.unwrap(), b"abcdefghijklmnop");
+    }
+
+    #[tokio::test]
     async fn corrupt_existing_target_is_removed_for_redownload() {
         let temp = tempfile::tempdir().unwrap();
         let target = temp.path().join("file.bin");
@@ -1342,7 +1844,7 @@ mod tests {
             state: temp.path().join("file.bin.mget-state.json"),
         };
 
-        assert_eq!(task_remaining_size(&task).await.unwrap(), 6);
+        assert_eq!(task_remaining_size(&task, 8).await.unwrap(), 6);
     }
 
     #[tokio::test]
@@ -1364,7 +1866,7 @@ mod tests {
             state,
         };
 
-        assert_eq!(task_remaining_size(&task).await.unwrap(), 10);
+        assert_eq!(task_remaining_size(&task, 8).await.unwrap(), 10);
     }
 
     #[tokio::test]
@@ -1418,5 +1920,150 @@ mod tests {
 
         assert!(tokio::fs::metadata(&state).await.is_err());
         assert!(tokio::fs::metadata(&part).await.is_err());
+    }
+
+    #[tokio::test]
+    async fn range_failure_keeps_completed_chunks_for_retry() {
+        use reqwest::header::HeaderMap;
+        use wiremock::{
+            Mock, MockServer, ResponseTemplate,
+            matchers::{header, method, path},
+        };
+
+        let server = MockServer::start().await;
+        Mock::given(method("HEAD"))
+            .and(path("/file.bin"))
+            .respond_with(ResponseTemplate::new(206).insert_header("content-range", "bytes 0-0/16"))
+            .mount(&server)
+            .await;
+        Mock::given(method("GET"))
+            .and(path("/file.bin"))
+            .and(header("range", "bytes=0-7"))
+            .respond_with(
+                ResponseTemplate::new(206)
+                    .insert_header("content-range", "bytes 0-7/16")
+                    .set_body_bytes(b"abcdefgh".to_vec()),
+            )
+            .mount(&server)
+            .await;
+        Mock::given(method("GET"))
+            .and(path("/file.bin"))
+            .and(header("range", "bytes=8-15"))
+            .respond_with(ResponseTemplate::new(500))
+            .mount(&server)
+            .await;
+
+        let temp = tempfile::tempdir().unwrap();
+        let target = temp.path().join("file.bin");
+        let part = target.with_extension("bin.mget-part");
+        let state = target.with_extension("bin.mget-state.json");
+        let task = FileTask {
+            remote: RemoteFile {
+                path: "file.bin".into(),
+                size: Some(16),
+                sha256: None,
+                md5: None,
+            },
+            url: format!("{}/file.bin", server.uri()),
+            target,
+            part: part.clone(),
+            state: state.clone(),
+        };
+        let progress = DownloadProgress {
+            multi: MultiProgress::new(),
+            total: ProgressBar::hidden(),
+            completed: AtomicUsize::new(0),
+            total_files: 1,
+        };
+
+        download_file(
+            &Client::new(),
+            HeaderMap::new(),
+            task.clone(),
+            &progress,
+            test_tuning(),
+        )
+        .await
+        .unwrap_err();
+
+        assert!(tokio::fs::metadata(&part).await.is_ok());
+        assert!(tokio::fs::metadata(&state).await.is_ok());
+        let state = RangeState::load(&state, 2).await.unwrap();
+        assert_eq!(state.completed, vec![true, false]);
+        let data = tokio::fs::read(&part).await.unwrap();
+        assert_eq!(data.len(), 16);
+        assert_eq!(&data[..8], b"abcdefgh");
+    }
+
+    #[tokio::test]
+    async fn range_chunk_retries_transient_failure() {
+        use reqwest::header::HeaderMap;
+        use wiremock::{
+            Mock, MockServer, ResponseTemplate,
+            matchers::{header, method, path},
+        };
+
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/file.bin"))
+            .and(header("range", "bytes=0-7"))
+            .respond_with(ResponseTemplate::new(500))
+            .up_to_n_times(1)
+            .mount(&server)
+            .await;
+        Mock::given(method("GET"))
+            .and(path("/file.bin"))
+            .and(header("range", "bytes=0-7"))
+            .respond_with(
+                ResponseTemplate::new(206)
+                    .insert_header("content-range", "bytes 0-7/16")
+                    .set_body_bytes(b"abcdefgh".to_vec()),
+            )
+            .mount(&server)
+            .await;
+        Mock::given(method("GET"))
+            .and(path("/file.bin"))
+            .and(header("range", "bytes=8-15"))
+            .respond_with(
+                ResponseTemplate::new(206)
+                    .insert_header("content-range", "bytes 8-15/16")
+                    .set_body_bytes(b"ijklmnop".to_vec()),
+            )
+            .mount(&server)
+            .await;
+
+        let temp = tempfile::tempdir().unwrap();
+        let target = temp.path().join("file.bin");
+        let part = target.with_extension("bin.mget-part");
+        let task = FileTask {
+            remote: RemoteFile {
+                path: "file.bin".into(),
+                size: Some(16),
+                sha256: None,
+                md5: None,
+            },
+            url: format!("{}/file.bin", server.uri()),
+            target: target.clone(),
+            part,
+            state: target.with_extension("bin.mget-state.json"),
+        };
+        let total_bar = ProgressBar::hidden();
+
+        download_range_file(
+            &Client::new(),
+            HeaderMap::new(),
+            &task,
+            ProgressBars {
+                total: &total_bar,
+                detail: None,
+            },
+            16,
+            test_tuning(),
+            Arc::new(AtomicU64::new(0)),
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(tokio::fs::read(&target).await.unwrap(), b"abcdefghijklmnop");
     }
 }

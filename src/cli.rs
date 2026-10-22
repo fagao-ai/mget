@@ -75,6 +75,32 @@ mod tests {
         let cli = Cli::parse_from(["mget", "ping"]);
         assert!(matches!(cli.command, Commands::Ping));
     }
+
+    #[test]
+    fn parses_hf_mirror_net_source() {
+        for value in ["hf-mirror-net", "hf-mirror.net"] {
+            let cli = Cli::parse_from(["mget", "download", "org/model", "--source", value]);
+            let Commands::Download(args) = cli.command else {
+                panic!("expected download command");
+            };
+            assert_eq!(args.source, SourceChoice::HfMirrorNet);
+        }
+    }
+
+    #[test]
+    fn defaults_to_http1_and_accepts_http2_flag() {
+        let default = Cli::parse_from(["mget", "download", "org/model"]);
+        let Commands::Download(default) = default.command else {
+            panic!("expected download command");
+        };
+        assert!(!default.http2);
+
+        let forced = Cli::parse_from(["mget", "download", "org/model", "--http2"]);
+        let Commands::Download(forced) = forced.command else {
+            panic!("expected download command");
+        };
+        assert!(forced.http2);
+    }
 }
 
 #[derive(Debug, Subcommand)]
@@ -115,9 +141,15 @@ pub struct DownloadArgs {
     /// Output directory. Defaults to the unified mget cache.
     #[arg(short, long)]
     pub output: Option<PathBuf>,
-    /// Number of concurrent file/chunk downloads.
+    /// Number of files downloaded concurrently.
     #[arg(short = 't', long)]
     pub threads: Option<usize>,
+    /// Concurrent range chunks per file (default: config value, usually 4).
+    #[arg(long)]
+    pub chunk_threads: Option<usize>,
+    /// Enable HTTP/2 instead of the default HTTP/1.1 transport.
+    #[arg(long)]
+    pub http2: bool,
     /// Repository revision, branch, or commit.
     #[arg(long, default_value = "main")]
     pub revision: String,
@@ -170,7 +202,10 @@ impl DownloadArgs {
 pub enum SourceChoice {
     Auto,
     Hf,
+    #[value(alias = "hf-mirror.com")]
     HfMirror,
+    #[value(name = "hf-mirror-net", alias = "hf-mirror.net")]
+    HfMirrorNet,
     Modelscope,
 }
 

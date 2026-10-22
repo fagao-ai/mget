@@ -24,6 +24,7 @@ impl HuggingFaceSource {
         let base_url = match kind {
             SourceKind::HuggingFace => "https://huggingface.co",
             SourceKind::HfMirror => "https://hf-mirror.com",
+            SourceKind::HfMirrorNet => "https://hf-mirror.net",
             SourceKind::ModelScope => unreachable!("use ModelScopeSource"),
         };
         Self::with_base_url(kind, base_url, token)

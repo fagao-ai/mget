@@ -10,6 +10,7 @@ pub struct Config {
     pub hf_token: Option<String>,
     pub modelscope_token: Option<String>,
     pub default_threads: usize,
+    pub default_chunk_threads: usize,
     pub cache_dir: PathBuf,
 }
 
@@ -18,6 +19,7 @@ struct FileConfig {
     hf_token: Option<String>,
     modelscope_token: Option<String>,
     default_threads: Option<usize>,
+    default_chunk_threads: Option<usize>,
     cache_dir: Option<PathBuf>,
 }
 
@@ -26,6 +28,7 @@ pub struct EffectiveConfig {
     pub hf_token: Option<String>,
     pub modelscope_token: Option<String>,
     pub threads: usize,
+    pub chunk_threads: usize,
     pub cache_dir: PathBuf,
 }
 
@@ -40,6 +43,7 @@ impl Config {
             hf_token: env_first(&["HF_TOKEN", "HUGGINGFACE_HUB_TOKEN"]).or(file.hf_token),
             modelscope_token: env_first(&["MODELSCOPE_API_TOKEN"]).or(file.modelscope_token),
             default_threads: file.default_threads.unwrap_or(6).max(1),
+            default_chunk_threads: file.default_chunk_threads.unwrap_or(4).max(1),
             cache_dir: file.cache_dir.unwrap_or(default_cache),
         })
     }
@@ -52,6 +56,10 @@ impl Config {
                 .clone()
                 .or_else(|| self.modelscope_token.clone()),
             threads: args.threads.unwrap_or(self.default_threads).max(1),
+            chunk_threads: args
+                .chunk_threads
+                .unwrap_or(self.default_chunk_threads)
+                .max(1),
             cache_dir: self.cache_dir.clone(),
         }
     }
@@ -86,6 +94,7 @@ mod tests {
             hf_token: Some("file-hf".into()),
             modelscope_token: Some("file-ms".into()),
             default_threads: 4,
+            default_chunk_threads: 3,
             cache_dir: PathBuf::from("/tmp/mget"),
         };
         let args = DownloadArgs {
@@ -96,6 +105,8 @@ mod tests {
             source: SourceChoice::Auto,
             output: None,
             threads: Some(16),
+            chunk_threads: Some(5),
+            http2: false,
             revision: "main".into(),
             files: vec![],
             includes: vec![],
@@ -111,5 +122,6 @@ mod tests {
         assert_eq!(effective.hf_token.as_deref(), Some("cli-hf"));
         assert_eq!(effective.modelscope_token.as_deref(), Some("file-ms"));
         assert_eq!(effective.threads, 16);
+        assert_eq!(effective.chunk_threads, 5);
     }
 }

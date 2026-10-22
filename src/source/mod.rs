@@ -40,6 +40,7 @@ impl fmt::Display for RepoType {
 pub enum SourceKind {
     HuggingFace,
     HfMirror,
+    HfMirrorNet,
     ModelScope,
 }
 
@@ -48,6 +49,7 @@ impl SourceKind {
         match self {
             Self::HuggingFace => "Hugging Face",
             Self::HfMirror => "HF Mirror",
+            Self::HfMirrorNet => "HF Mirror (.net)",
             Self::ModelScope => "ModelScope",
         }
     }
@@ -55,7 +57,7 @@ impl SourceKind {
     pub fn cache_segment(self) -> &'static str {
         match self {
             Self::HuggingFace => "huggingface",
-            Self::HfMirror => "hf-mirror",
+            Self::HfMirror | Self::HfMirrorNet => "hf-mirror",
             Self::ModelScope => "modelscope",
         }
     }
@@ -83,6 +85,7 @@ pub struct RemoteFile {
     pub md5: Option<String>,
 }
 
+#[allow(clippy::double_must_use)]
 #[async_trait]
 pub trait ModelSource: Send + Sync {
     fn source_kind(&self) -> SourceKind;
