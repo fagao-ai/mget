@@ -1,4 +1,5 @@
 use std::env;
+use std::path::Path;
 use std::process::Command;
 
 fn git(args: &[&str]) -> Option<String> {
@@ -12,7 +13,11 @@ fn git(args: &[&str]) -> Option<String> {
 
 fn main() {
     println!("cargo:rerun-if-env-changed=MGET_VERSION");
-    println!("cargo:rerun-if-changed=.git/HEAD");
+    for path in [".git/HEAD", ".git/refs/heads/main"] {
+        if Path::new(path).exists() {
+            println!("cargo:rerun-if-changed={path}");
+        }
+    }
 
     let package_version = env::var("CARGO_PKG_VERSION").unwrap_or_else(|_| "0.0.0".into());
     let release_version = env::var("MGET_VERSION")
